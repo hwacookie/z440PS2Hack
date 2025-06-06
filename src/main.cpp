@@ -10,21 +10,32 @@
  */
 
 #include <Arduino.h>
-#include <ps2dev.h>  // Harvie's PS/2 device emulation library
-#include <DHT.h>     // Adafruit DHT Sensor Library
-#include <math.h>    // For log() in thermistor calculation
+#include <ps2dev.h> // Harvie's PS/2 device emulation library
+#include <DHT.h>    // Adafruit DHT Sensor Library
+#include <math.h>   // For log() in thermistor calculation
+
+// Forward declaration for PS/2 keyboard reset callback
+void keyboardResetCallback();
+
+volatile bool startupSequenceRunning = false;
 
 // --- Pin Definitions ---
-#define PS2_CLK_PIN  2 // CLK pin
+#define PS2_CLK_PIN 2  // CLK pin
 #define PS2_DATA_PIN 3 // DATA pin
-#define DHT_PIN 9    // DHT22 data pin connected to Arduino D9
+#define DHT_PIN 9      // DHT22 data pin connected to Arduino D9
 #define DHT_TYPE DHT22
-#define PIR_PIN 4    // Digital pin for PIR sensor output
+#define PIR_PIN 4 // Digital pin for PIR sensor output
 #define THERMISTOR_PIN_1 A0
 #define THERMISTOR_PIN_2 A1
 #define THERMISTOR_PIN_3 A2
 #define THERMISTOR_PIN_4 A3
 #define BOOT_LED_PIN LED_BUILTIN
+
+// LED lock status pins (default to LED_BUILTIN)
+#define SCROLL_LOCK_LED_PIN LED_BUILTIN // bit 0: Scroll Lock
+#define NUM_LOCK_LED_PIN LED_BUILTIN    // bit 1: Num Lock
+#define CAPS_LOCK_LED_PIN LED_BUILTIN   // bit 2: Caps Lock
+#define KEYBOARD_LED_PIN LED_BUILTIN    // the master LED pin (used if we have jusft one LED for all keyboard status)
 
 // --- Thermistor Configuration ---
 #define FIXED_RESISTOR 10000.0
@@ -34,9 +45,14 @@
 #define ADC_MAX 1023.0
 #define ADC_VREF 5.0
 
+// --- Debugging Configuration ---
+// Set to "Serial"" to enable debug output, or comment-out to disable debug output
+//#define DEBUG_LOG_DEVICE Serial
+
 // --- Global Objects ---
 PS2dev keyboard(PS2_CLK_PIN, PS2_DATA_PIN);
 DHT dht(DHT_PIN, DHT_TYPE);
+bool keyboard_initialized = false; // will be set to true once we receive the first reset_callback from the PS/2 keyboard
 
 // --- Global Variables for Sensor Data & Configuration ---
 #define SENSOR_READ_INTERVAL_MILLISECONDS 5000
@@ -50,36 +66,69 @@ float currentThermistorTemps[4] = {NAN, NAN, NAN, NAN};
 bool isMotionCurrentlyActive = false; // Renamed from motionDetectedState for clarity in JSON
 
 // PIR State (internal for edge detection)
-bool internalPirState = LOW; 
+bool internalPirState = LOW;
 unsigned long lastMotionTriggerTime = 0;
 #define MOTION_DEBOUNCE_DELAY 5000 // Ignore PIR re-triggers for 5 seconds
 
-
 // --- Key Sequence Definition ---
-enum KeyActionType { NORMAL_KEY, SPECIAL_KEY };
-struct TimedKeyAction {
+enum KeyActionType
+{
+    NORMAL_KEY,
+    SPECIAL_KEY
+};
+struct TimedKeyAction
+{
     int delaySeconds;
     KeyActionType keyType;
-    union { PS2dev::ScanCodes normalKey; PS2dev::SpecialScanCodes specialKey; } key;
-    const char* keyName;
+    union
+    {
+        PS2dev::ScanCodes normalKey;
+        PS2dev::SpecialScanCodes specialKey;
+    } key;
+    const char *keyName;
 };
 const TimedKeyAction keySequence[] = {
 
     // This I used for a "more complicated" boot sequence
-    /*  
+    /*
     {11, NORMAL_KEY,  {.normalKey = PS2dev::ScanCodes::F8},         "F8"},
     {11, SPECIAL_KEY, {.specialKey = PS2dev::SpecialScanCodes::DOWN_ARROW}, "ARROW DOWN"},
     {3,  NORMAL_KEY,  {.normalKey = PS2dev::ScanCodes::ENTER},      "ENTER"},
     {3,  NORMAL_KEY,  {.normalKey = PS2dev::ScanCodes::ESCAPE},     "ESCAPE"},
-    {3,  NORMAL_KEY,  {.normalKey = PS2dev::ScanCodes::ENTER},      "ENTER"}, 
+    {3,  NORMAL_KEY,  {.normalKey = PS2dev::ScanCodes::ENTER},      "ENTER"},
     */
     // Trying four times with a 10 second delay inbetween
-    {10,  NORMAL_KEY,  {.normalKey = PS2dev::ScanCodes::ENTER},      "ENTER"},
-    {10,  NORMAL_KEY,  {.normalKey = PS2dev::ScanCodes::ENTER},      "ENTER"},
-    {10,  NORMAL_KEY,  {.normalKey = PS2dev::ScanCodes::ENTER},      "ENTER"},
-    {10,  NORMAL_KEY,  {.normalKey = PS2dev::ScanCodes::ENTER},      "ENTER"}
-};
+    {10, NORMAL_KEY, {.normalKey = PS2dev::ScanCodes::ENTER}, "ENTER"},
+    {10, NORMAL_KEY, {.normalKey = PS2dev::ScanCodes::ENTER}, "ENTER"},
+    {10, NORMAL_KEY, {.normalKey = PS2dev::ScanCodes::ENTER}, "ENTER"},
+    {10, NORMAL_KEY, {.normalKey = PS2dev::ScanCodes::ENTER}, "ENTER"}};
 const int numKeyActions = sizeof(keySequence) / sizeof(keySequence[0]);
+
+// Forward declarations of functions
+void keyboardResetCallback();
+
+void handle_leds()
+{
+// Handle individual lock LEDs
+#ifdef DEBUG_LOG_DEVICE
+
+    DEBUG_LOG_DEVICE.print(F("LOG: handle_leds() - Scroll Lock:"));
+    DEBUG_LOG_DEVICE.print((kbd_leds & 0x01) ? '1' : '0');
+    DEBUG_LOG_DEVICE.print(F(" Num Lock:"));
+    DEBUG_LOG_DEVICE.print((kbd_leds & 0x02) ? '1' : '0');
+    DEBUG_LOG_DEVICE.print(F(" Caps Lock:"));
+    DEBUG_LOG_DEVICE.print((kbd_leds & 0x04) ? '1' : '0');
+    DEBUG_LOG_DEVICE.println();
+#endif
+    // Set the state of the lock LEDs based on kbd_leds bits
+    digitalWrite(SCROLL_LOCK_LED_PIN, (kbd_leds & 0x01) ? HIGH : LOW);
+    digitalWrite(NUM_LOCK_LED_PIN, (kbd_leds & 0x02) ? HIGH : LOW);
+    digitalWrite(CAPS_LOCK_LED_PIN, (kbd_leds & 0x04) ? HIGH : LOW);
+
+
+    digitalWrite(KEYBOARD_LED_PIN, (kbd_leds) ? HIGH : LOW);
+
+}
 
 // --- Sensor Update Functions ---
 
@@ -91,22 +140,32 @@ const int numKeyActions = sizeof(keySequence) / sizeof(keySequence[0]);
  * and `currentDhtTempC` variables. Includes basic error logging if the
  * sensor reading fails.
  */
-void updateDHTData() {
-    Serial.println(F("LOG: updateDHTData() - Reading DHT22 sensor."));
+void updateDHTData()
+{
+#ifdef DEBUG_LOG_DEVICE
+    DEBUG_LOG_DEVICE.println(F("LOG: updateDHTData() - Reading DHT22 sensor."));
+#endif
     currentHumidity = dht.readHumidity();
     currentDhtTempC = dht.readTemperature();
-    if (isnan(currentHumidity) || isnan(currentDhtTempC)) {
-        Serial.println(F("LOG: updateDHTData() - Failed to read from DHT sensor!"));
-    } else {
-        Serial.println(F("LOG: updateDHTData() - DHT22 data updated."));
+
+
+#ifdef DEBUG_LOG_DEVICE
+    if (isnan(currentHumidity) || isnan(currentDhtTempC))
+    {
+        DEBUG_LOG_DEVICE.println(F("LOG: updateDHTData() - Failed to read from DHT sensor!"));
     }
+    else
+    {
+        DEBUG_LOG_DEVICE.println(F("LOG: updateDHTData() - DHT22 data updated."));
+    }
+#endif
 }
 
 /**
  * @brief Reads an analog value from a thermistor and converts it to temperature in Celsius.
  *
  * THIS IS STILL A WORK IN PROGRESS, IT IS NOT YET TESTED!
- * 
+ *
  * This function reads the analog voltage from a thermistor connected to the specified
  * analog pin, calculates its resistance, and then uses the Steinhart-Hart equation
  * to convert the resistance to temperature in Celsius. Includes logging for ADC value
@@ -116,35 +175,55 @@ void updateDHTData() {
  * @param thermistorName A descriptive name for the thermistor (used in logging).
  * @return The temperature in Celsius, or NAN if the reading is unstable or invalid.
  */
-float readThermistorValue(int analogPin, const char* thermistorName) {
+float readThermistorValue(int analogPin, const char *thermistorName)
+{
     int adcValue = analogRead(analogPin);
-    if (adcValue < 10 || adcValue > (ADC_MAX - 10)) {
-        Serial.print(F("LOG: readThermistorValue() - Unstable ADC for ")); Serial.print(thermistorName);
-        Serial.print(F(": ")); Serial.println(adcValue);
+    if (adcValue < 10 || adcValue > (ADC_MAX - 10))
+    {
+#ifdef DEBUG_LOG_DEVICE
+        DEBUG_LOG_DEVICE.print(F("LOG: readThermistorValue() - Unstable ADC for "));
+        DEBUG_LOG_DEVICE.print(thermistorName);
+        DEBUG_LOG_DEVICE.print(F(": "));
+        DEBUG_LOG_DEVICE.println(adcValue);
+#endif
         return NAN;
     }
     float voltage = (adcValue / ADC_MAX) * ADC_VREF;
     float resistance = (FIXED_RESISTOR * voltage) / (ADC_VREF - voltage);
-    if (resistance <= 0) {
-        Serial.print(F("LOG: readThermistorValue() - Invalid resistance for ")); Serial.print(thermistorName);
-        Serial.print(F(": ")); Serial.println(resistance);
+    if (resistance <= 0)
+    {
+#ifdef DEBUG_LOG_DEVICE
+        DEBUG_LOG_DEVICE.print(F("LOG: readThermistorValue() - Invalid resistance for "));
+        DEBUG_LOG_DEVICE.print(thermistorName);
+        DEBUG_LOG_DEVICE.print(F(": "));
+        DEBUG_LOG_DEVICE.println(resistance);
+#endif
         return NAN;
     }
     float steinhart = log(resistance / NOMINAL_RESISTANCE) / B_COEFFICIENT + 1.0 / (NOMINAL_TEMPERATURE + 273.15);
-    if (steinhart == 0) {
-        Serial.print(F("LOG: readThermistorValue() - Steinhart error for ")); Serial.println(thermistorName);
+    if (steinhart == 0)
+    {
+#ifdef DEBUG_LOG_DEVICE
+        DEBUG_LOG_DEVICE.print(F("LOG: readThermistorValue() - Steinhart error for "));
+        DEBUG_LOG_DEVICE.println(thermistorName);
+#endif
         return NAN;
     }
     float tempC = (1.0 / steinhart) - 273.15;
-    Serial.print(F("LOG: readThermistorValue() - ")); Serial.print(thermistorName);
-    Serial.print(F(" ADC: ")); Serial.print(adcValue);
-    Serial.print(F(", Temp C: ")); Serial.println(tempC, 2);
+#ifdef DEBUG_LOG_DEVICE
+    DEBUG_LOG_DEVICE.print(F("LOG: readThermistorValue() - "));
+    DEBUG_LOG_DEVICE.print(thermistorName);
+    DEBUG_LOG_DEVICE.print(F(" ADC: "));
+    DEBUG_LOG_DEVICE.print(adcValue);
+    DEBUG_LOG_DEVICE.print(F(", Temp C: "));
+    DEBUG_LOG_DEVICE.println(tempC, 2);
+#endif
     return tempC;
 }
 
 /**
  * @brief Updates the state of the PIR motion sensor.
- * 
+ *
  * THIS IS STILL A WORK IN PROGRESS, IT IS NOT YET TESTED!
  *
  * This function reads the digital state of the PIR sensor pin. It detects
@@ -153,20 +232,30 @@ float readThermistorValue(int analogPin, const char* thermistorName) {
  * multiple triggers from a single event. Updates the global `isMotionCurrentlyActive`
  * variable and logs state changes.
  */
-void updatePIRState() {
+void updatePIRState()
+{
     int currentPirReading = digitalRead(PIR_PIN);
     unsigned long currentTime = millis();
 
-    if (currentPirReading == HIGH) {
-        if (internalPirState == LOW && (currentTime - lastMotionTriggerTime > MOTION_DEBOUNCE_DELAY)) {
-            Serial.println(F("LOG: updatePIRState() - Motion DETECTED!"));
+    if (currentPirReading == HIGH)
+    {
+        if (internalPirState == LOW && (currentTime - lastMotionTriggerTime > MOTION_DEBOUNCE_DELAY))
+        {
+#ifdef DEBUG_LOG_DEVICE
+            DEBUG_LOG_DEVICE.println(F("LOG: updatePIRState() - Motion DETECTED!"));
+#endif
             isMotionCurrentlyActive = true;
             lastMotionTriggerTime = currentTime;
         }
         internalPirState = HIGH; // Update internal state regardless of debounce for edge detection
-    } else { // currentPirReading == LOW
-        if (internalPirState == HIGH) {
-            Serial.println(F("LOG: updatePIRState() - Motion ended."));
+    }
+    else
+    { // currentPirReading == LOW
+        if (internalPirState == HIGH)
+        {
+#ifdef DEBUG_LOG_DEVICE
+            DEBUG_LOG_DEVICE.println(F("LOG: updatePIRState() - Motion ended."));
+#endif
             isMotionCurrentlyActive = false; // Set to false as soon as signal goes low
         }
         internalPirState = LOW;
@@ -180,25 +269,39 @@ void updatePIRState() {
  * thermistor temperatures, and PIR motion state) into a JSON string and sends
  * it over the serial port. Handles NAN values by outputting "null" in the JSON.
  */
-void sendDatagram() {
+void sendDatagram()
+{
     Serial.print(F("{\"humidity\":"));
-    if (isnan(currentHumidity)) Serial.print(F("null")); else Serial.print(currentHumidity, 1);
+    if (isnan(currentHumidity))
+        Serial.print(F("null"));
+    else
+        Serial.print(currentHumidity, 1);
 
     Serial.print(F(",\"temp_dht\":"));
-    if (isnan(currentDhtTempC)) Serial.print(F("null")); else Serial.print(currentDhtTempC, 1);
+    if (isnan(currentDhtTempC))
+        Serial.print(F("null"));
+    else
+        Serial.print(currentDhtTempC, 1);
 
     Serial.print(F(",\"thermistors\":["));
-    for (int i = 0; i < 4; i++) {
-        if (isnan(currentThermistorTemps[i])) Serial.print(F("null")); else Serial.print(currentThermistorTemps[i], 1);
-        if (i < 3) Serial.print(F(","));
+    for (int i = 0; i < 4; i++)
+    {
+        if (isnan(currentThermistorTemps[i]))
+            Serial.print(F("null"));
+        else
+            Serial.print(currentThermistorTemps[i], 1);
+        if (i < 3)
+            Serial.print(F(","));
     }
     Serial.print(F("]"));
 
     Serial.print(F(",\"motion\":"));
     Serial.print(isMotionCurrentlyActive ? F("true") : F("false"));
-    
+
     Serial.println(F("}"));
-    Serial.println(F("LOG: sendDatagram() - Datagram sent."));
+#ifdef DEBUG_LOG_DEVICE
+    DEBUG_LOG_DEVICE.println(F("LOG: sendDatagram() - Datagram sent."));
+#endif
 }
 
 // --- Setup and Loop ---
@@ -214,28 +317,48 @@ void sendDatagram() {
  * @param seconds The duration of the delay in seconds.
  * @param blinkLed If true, the built-in LED will blink during the delay with increasing frequency.
  */
-void performActiveDelay(int seconds, bool blinkLed) {
-    Serial.print(F("LOG: performActiveDelay() - Starting delay of "));
-    Serial.print(seconds); Serial.println(F(" seconds..."));
+void performActiveDelay(int seconds, bool blinkLed)
+{
+#ifdef DEBUG_LOG_DEVICE
+    DEBUG_LOG_DEVICE.print(F("LOG: performActiveDelay() - Starting delay of "));
+    DEBUG_LOG_DEVICE.print(seconds);
+    DEBUG_LOG_DEVICE.println(F(" seconds..."));
+#endif
 
-    if (!blinkLed) {
+    if (!blinkLed)
+    {
         // Existing non-blinking delay logic
-        for (int i = 0; i < seconds * 100; ++i) {
-            if (keyboard.keyboard_handle(&kbd_leds)) { /* Optional log */ }
+        for (int i = 0; i < seconds * 100; ++i)
+        {
+            if (keyboard.keyboard_handle(&kbd_leds))
+            {
+                handle_leds();
+            }
             delay(10);
         }
-    } else {
+    }
+    else
+    {
         int total_seconds = seconds;
-        if (total_seconds <= 0) total_seconds = 1;
+        if (total_seconds <= 0)
+            total_seconds = 1;
 
-        for (int i = total_seconds; i > 0; i--) { // Loop through each second
-            Serial.print(F("LOG: performActiveDelay() - Countdown: ")); Serial.print(i); Serial.println(F(" seconds..."));
+        for (int i = total_seconds; i > 0; i--)
+        { // Loop through each second
+#ifdef DEBUG_LOG_DEVICE
+            DEBUG_LOG_DEVICE.print(F("LOG: performActiveDelay() - Countdown: "));
+            DEBUG_LOG_DEVICE.print(i);
+            DEBUG_LOG_DEVICE.println(F(" seconds..."));
+#endif
 
             // Calculate blinks per second (N)
             float N_float;
-            if (total_seconds == 1) {
+            if (total_seconds == 1)
+            {
                 N_float = 1.0;
-            } else {
+            }
+            else
+            {
                 // Linear interpolation from 1 blink/sec (at start) to 10 blinks/sec (at end)
                 N_float = 1.0 + 9.0 * (float)(total_seconds - i) / (float)(total_seconds - 1);
             }
@@ -247,13 +370,18 @@ void performActiveDelay(int seconds, bool blinkLed) {
 
             unsigned long start_second_millis = millis();
 
-            for (int blink_count = 0; blink_count < N; ++blink_count) {
+            for (int blink_count = 0; blink_count < N; ++blink_count)
+            {
                 // Turn LED ON
                 digitalWrite(BOOT_LED_PIN, HIGH);
                 // Delay for on_duration_ms while handling keyboard
                 unsigned long current_blink_start_millis = millis();
-                while (millis() - current_blink_start_millis < on_duration_ms) {
-                    if (keyboard.keyboard_handle(&kbd_leds)) { /* Optional log */ }
+                while (millis() - current_blink_start_millis < on_duration_ms)
+                {
+                    if (keyboard.keyboard_handle(&kbd_leds))
+                    {
+                        handle_leds();
+                    }
                     delay(1); // Yield
                 }
 
@@ -261,8 +389,12 @@ void performActiveDelay(int seconds, bool blinkLed) {
                 digitalWrite(BOOT_LED_PIN, LOW);
                 // Delay for off_duration_ms while handling keyboard
                 current_blink_start_millis = millis(); // Reuse variable
-                 while (millis() - current_blink_start_millis < off_duration_ms) {
-                    if (keyboard.keyboard_handle(&kbd_leds)) { /* Optional log */ }
+                while (millis() - current_blink_start_millis < off_duration_ms)
+                {
+                    if (keyboard.keyboard_handle(&kbd_leds))
+                    {
+                        handle_leds();
+                    }
                     delay(1); // Yield
                 }
             }
@@ -270,17 +402,24 @@ void performActiveDelay(int seconds, bool blinkLed) {
             // This handles potential drift from the small delays
             unsigned long end_second_millis = millis();
             long remaining_ms_in_second = 1000 - (end_second_millis - start_second_millis);
-            if (remaining_ms_in_second > 0) {
-                 unsigned long delay_start = millis();
-                 while(millis() - delay_start < remaining_ms_in_second) {
-                     if (keyboard.keyboard_handle(&kbd_leds)) { /* Optional log */ }
-                     delay(1); // Yield
-                 }
+            if (remaining_ms_in_second > 0)
+            {
+                unsigned long delay_start = millis();
+                while (millis() - delay_start < remaining_ms_in_second)
+                {
+                    if (keyboard.keyboard_handle(&kbd_leds))
+                    {
+                        handle_leds(); // Handle keyboard LEDs
+                    }
+                    delay(1); // Yield
+                }
             }
         }
         digitalWrite(BOOT_LED_PIN, LOW); // Ensure off at the end
     }
-    Serial.println(F("LOG: performActiveDelay() - Delay finished."));
+#ifdef DEBUG_LOG_DEVICE
+    DEBUG_LOG_DEVICE.println(F("LOG: performActiveDelay() - Delay finished."));
+#endif
 }
 
 /**
@@ -296,49 +435,46 @@ void performActiveDelay(int seconds, bool blinkLed) {
  * 7. Sends an initial JSON datagram with the first set of sensor readings.
  * 8. Sets up the timing for periodic sensor reads in the main loop.
  */
-void setup() {
-    pinMode(BOOT_LED_PIN, OUTPUT); digitalWrite(BOOT_LED_PIN, LOW);
+
+void setup()
+{
+    pinMode(BOOT_LED_PIN, OUTPUT);
+    digitalWrite(BOOT_LED_PIN, LOW);
     Serial.begin(115200);
-    Serial.println(F("LOG: setup() - Sketch starting. Serial initialized."));
+#ifdef DEBUG_LOG_DEVICE
+    DEBUG_LOG_DEVICE.println(F("LOG: setup() - Sketch starting. Serial initialized."));
+#endif
 
-    Serial.println(F("LOG: setup() - Initializing PS/2 keyboard emulation..."));
-    keyboard.keyboard_init();
-    Serial.println(F("LOG: setup() - PS/2 keyboard emulation initialized."));
+#ifdef DEBUG_LOG_DEVICE
+    DEBUG_LOG_DEVICE.println(F("LOG: setup() - Initializing PS/2 keyboard emulation..."));
+#endif
+    keyboard.keyboard_init(keyboardResetCallback);
+#ifdef DEBUG_LOG_DEVICE
+    DEBUG_LOG_DEVICE.println(F("LOG: setup() - PS/2 keyboard emulation initialized."));
+#endif
+}
 
-    for (int i = 0; i < numKeyActions; ++i) {
-        const TimedKeyAction& action = keySequence[i];
-        performActiveDelay(action.delaySeconds, action.delaySeconds>1);
-        Serial.print(F("LOG: setup() - Sending key: ")); Serial.println(action.keyName);
-        if (action.keyType == NORMAL_KEY) keyboard.keyboard_mkbrk(action.key.normalKey);
-        else if (action.keyType == SPECIAL_KEY) keyboard.keyboard_special_mkbrk(action.key.specialKey);
-        for(int d=0; d<10; ++d) { if (keyboard.keyboard_handle(&kbd_leds)) {} delay(10); }
-        Serial.print(F("LOG: setup() - Key ")); Serial.print(action.keyName); Serial.println(F(" sent."));
-    }
-    Serial.println(F("LOG: setup() - Key press sequence complete."));
+void initSensors()
+{
+#ifdef DEBUG_LOG_DEVICE
+    DEBUG_LOG_DEVICE.println(F("LOG: setup() - Initializing DHT22 sensor (post-keyboard sequence)..."));
+#endif
+    dht.begin();
+#ifdef DEBUG_LOG_DEVICE
+    DEBUG_LOG_DEVICE.println(F("LOG: setup() - DHT22 sensor initialization complete."));
+#endif
 
-    Serial.println(F("LOG: setup() - Initializing DHT22 sensor (post-keyboard sequence)..."));
-    dht.begin(); delay(2000);
-    Serial.println(F("LOG: setup() - DHT22 sensor initialization complete."));
-    
-    Serial.println(F("LOG: setup() - Initializing PIR sensor (post-keyboard sequence)..."));
+#ifdef DEBUG_LOG_DEVICE
+    DEBUG_LOG_DEVICE.println(F("LOG: setup() - Initializing PIR sensor (post-keyboard sequence)..."));
+#endif
     pinMode(PIR_PIN, INPUT);
-    Serial.println(F("LOG: setup() - PIR pin initialized. Waiting for PIR to settle..."));
+#ifdef DEBUG_LOG_DEVICE
+    DEBUG_LOG_DEVICE.println(F("LOG: setup() - PIR pin initialized. Waiting for PIR to settle..."));
+#endif
     performActiveDelay(15, false); // PIR settling time
-    Serial.println(F("LOG: setup() - PIR sensor settling time complete."));
-
-    // Initial sensor data population
-    updateDHTData();
-    updatePIRState(); // Get initial PIR state
-    currentThermistorTemps[0] = readThermistorValue(THERMISTOR_PIN_1, "Thermistor 1");
-    currentThermistorTemps[1] = readThermistorValue(THERMISTOR_PIN_2, "Thermistor 2");
-    currentThermistorTemps[2] = readThermistorValue(THERMISTOR_PIN_3, "Thermistor 3");
-    currentThermistorTemps[3] = readThermistorValue(THERMISTOR_PIN_4, "Thermistor 4");
-    
-    Serial.println(F("LOG: setup() - Initial sensor datagram send."));
-    sendDatagram(); // Send one datagram at the end of setup
-
-    Serial.println(F("LOG: setup() - Setup complete. Entering loop."));
-    previousSensorReadMillis = millis();
+#ifdef DEBUG_LOG_DEVICE
+    DEBUG_LOG_DEVICE.println(F("LOG: setup() - PIR sensor settling time complete."));
+#endif
 }
 
 /**
@@ -351,26 +487,88 @@ void setup() {
  *    If it is time:
  *    a. Updates DHT22 sensor data (humidity and temperature).
  *    b. Reads temperature from all four thermistors.
- *    c. Sends a JSON datagram containing all current sensor readings over serial.
+ *    c. Sends a JSON datagram containing all current sensor readings over DEBUG_LOG_DEVICE.
  * 4. Includes a small delay to yield processing time.
  */
-void loop() {
-    if (keyboard.keyboard_handle(&kbd_leds)) { /* Optional LED handling */ }
-    updatePIRState(); // Continuously check PIR state
-
-    unsigned long currentMillis = millis();
-    if (currentMillis - previousSensorReadMillis >= SENSOR_READ_INTERVAL_MILLISECONDS) { 
-        previousSensorReadMillis = currentMillis; 
-        
-        Serial.println(F("LOG: loop() - Time to update sensor data and send datagram."));
-        updateDHTData();
-        // PIR state is already updated by updatePIRState() called earlier in loop
-        currentThermistorTemps[0] = readThermistorValue(THERMISTOR_PIN_1, "Thermistor 1");
-        currentThermistorTemps[1] = readThermistorValue(THERMISTOR_PIN_2, "Thermistor 2");
-        currentThermistorTemps[2] = readThermistorValue(THERMISTOR_PIN_3, "Thermistor 3");
-        currentThermistorTemps[3] = readThermistorValue(THERMISTOR_PIN_4, "Thermistor 4");
-        
-        sendDatagram();
+void loop()
+{
+    if (keyboard.keyboard_handle(&kbd_leds))
+    {
+        handle_leds();
     }
-    delay(1); 
+
+    // only run the loop if the keyboard is initialized and we are not in the startup sequence
+    if (keyboard_initialized && !startupSequenceRunning)
+    {
+        updatePIRState(); // Continuously check PIR state
+
+        unsigned long currentMillis = millis();
+        if (currentMillis - previousSensorReadMillis >= SENSOR_READ_INTERVAL_MILLISECONDS)
+        {
+            previousSensorReadMillis = currentMillis;
+
+#ifdef DEBUG_LOG_DEVICE
+            DEBUG_LOG_DEVICE.println(F("LOG: loop() - Time to update sensor data and send datagram."));
+#endif
+            updateDHTData();
+            // PIR state is already updated by updatePIRState() called earlier in loop
+            currentThermistorTemps[0] = readThermistorValue(THERMISTOR_PIN_1, "Thermistor 1");
+            currentThermistorTemps[1] = readThermistorValue(THERMISTOR_PIN_2, "Thermistor 2");
+            currentThermistorTemps[2] = readThermistorValue(THERMISTOR_PIN_3, "Thermistor 3");
+            currentThermistorTemps[3] = readThermistorValue(THERMISTOR_PIN_4, "Thermistor 4");
+
+            sendDatagram();
+        }
+    }
+    delay(1);
+}
+
+// reset callback handling
+
+void runStartupSequence()
+{
+    for (int i = 0; i < numKeyActions; ++i)
+    {
+        const TimedKeyAction &action = keySequence[i];
+        performActiveDelay(action.delaySeconds, action.delaySeconds > 1);
+#ifdef DEBUG_LOG_DEVICE
+        DEBUG_LOG_DEVICE.print(F("LOG: runStartupSequence() - Sending key: "));
+#endif
+#ifdef DEBUG_LOG_DEVICE
+        DEBUG_LOG_DEVICE.println(action.keyName);
+#endif
+        if (action.keyType == NORMAL_KEY)
+            keyboard.keyboard_mkbrk(action.key.normalKey);
+        else if (action.keyType == SPECIAL_KEY)
+            keyboard.keyboard_special_mkbrk(action.key.specialKey);
+        for (int d = 0; d < 10; ++d)
+        {
+            if (keyboard.keyboard_handle(&kbd_leds))
+            {
+                handle_leds(); // Handle keyboard LEDs
+            }
+            delay(10);
+        }
+#ifdef DEBUG_LOG_DEVICE
+        DEBUG_LOG_DEVICE.print(F("LOG: runStartupSequence() - Key "));
+        DEBUG_LOG_DEVICE.print(action.keyName);
+        DEBUG_LOG_DEVICE.println(F(" sent."));
+#endif
+    }
+#ifdef DEBUG_LOG_DEVICE
+    DEBUG_LOG_DEVICE.println(F("LOG: runStartupSequence() - Key press sequence complete."));
+#endif
+
+    initSensors();
+}
+
+void keyboardResetCallback()
+{
+#ifdef DEBUG_LOG_DEVICE
+    DEBUG_LOG_DEVICE.println(F("LOG: keyboardResetCallback() - Running startup sequence due to keyboard reset."));
+#endif
+    keyboard_initialized = true; // Reset keyboard state
+    startupSequenceRunning = true;
+    runStartupSequence();
+    startupSequenceRunning = false;
 }
