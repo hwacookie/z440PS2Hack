@@ -20,3 +20,7 @@ The device is intended to be powered from the PS/2 port.
 *   **Data Serialization**: Outputs sensor data in JSON format for easy parsing by other systems.
 *   **RAM Optimization**: Uses `F()` macro for string literals to conserve RAM on the ATmega168P.
 *   **Active Delay with Feedback**: Provides visual feedback (LED blinking) during delays and maintains PS/2 keyboard responsiveness.
+
+## Todo List:
+
+* Add an LDR sensor.

@@ -17,7 +17,7 @@ __State:__ Closed
 
 ## Challenges
 
-- Debugging PS2 communication timing issues.
+- Debugging PS2 communication protocol issues.
 - Ensuring compatibility with hardware.
 
 ## Open Issues
@@ -27,8 +27,6 @@ __State:__ Closed
 
 ## Decisions
 
-- Use PlatformIO for project build and management.
-- Focus on PS2 controller integration first.
 
 ## Summary
 
